@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { db } from '../firebaseConfig';
-import { collection, doc, getDocs, setDoc, updateDoc } from 'firebase/firestore';
+import { collection, doc, onSnapshot, setDoc, getDocs, updateDoc } from 'firebase/firestore';
 
 const TabletPenTracker = () => {
   const [stage, setStage] = useState('selectMode');  // 'selectMode', 'enterName', 'borrow', 'return', 'admin'
@@ -17,20 +17,23 @@ const TabletPenTracker = () => {
   const formatDate = date => date ? `${date.getFullYear()}/${(date.getMonth()+1).toString().padStart(2,'0')}/${date.getDate().toString().padStart(2,'0')}` : '';
   const remainingDays = end => end ? Math.ceil((new Date(end) - new Date())/(1000*60*60*24)) : null;
 
-  // fetch or init
+  // real-time fetch/init with onSnapshot
   useEffect(() => {
     if (stage === 'selectMode' || stage === 'enterName') return;
-    (async () => {
-      const snap = await getDocs(collection(db, 'pens'));
-      if (snap.empty) {
-        const arr = [];
-        for (let i = 1; i <= 92; i++) {
-          await setDoc(doc(db,'pens',`${i}`), { borrower: null, startDate: null, endDate: null, repairing: false });
-          arr.push({ id: i, borrower: null, startDate: null, endDate: null, repairing: false });
-        }
-        setPens(arr);
+    const pensRef = collection(db, 'pens');
+    const unsubscribe = onSnapshot(pensRef, snapshot => {
+      if (snapshot.empty) {
+        // 如果集合還沒初始化，就一次寫入 1~92 筆
+        (async () => {
+          const arr = [];
+          for (let i = 1; i <= 92; i++) {
+            await setDoc(doc(db,'pens',`${i}`), { borrower: null, startDate: null, endDate: null, repairing: false });
+            arr.push({ id: i, borrower: null, startDate: null, endDate: null, repairing: false });
+          }
+          setPens(arr);
+        })();
       } else {
-        const arr = snap.docs.map(d => {
+        const arr = snapshot.docs.map(d => {
           const dt = d.data();
           return {
             id: parseInt(d.id, 10),
@@ -40,11 +43,12 @@ const TabletPenTracker = () => {
             repairing: dt.repairing || false
           };
         });
-        arr.sort((a,b)=>a.id-b.id);
+        arr.sort((a, b) => a.id - b.id);
         setPens(arr);
       }
       setSelectedIds([]);
-    })();
+    });
+    return () => unsubscribe();
   }, [stage]);
 
   const chooseMode = m => { setAction(m); setStage('enterName'); };
@@ -60,27 +64,26 @@ const TabletPenTracker = () => {
   const visible = (stage==='borrow' || stage==='admin')
     ? pens
     : stage==='return'
-      ? (isManager ? pens : pens.filter(p=>p.borrower===userName))
+      ? (isManager ? pens : pens.filter(p => p.borrower === userName))
       : [];
-  const allIds = visible.map(p=>p.id);
+  const allIds = visible.map(p => p.id);
 
-  const toggleAll = () => setSelectedIds(prev=> prev.length===allIds.length?[]:allIds);
-  const toggleOne = id => setSelectedIds(prev=> prev.includes(id)? prev.filter(x=>x!==id) : [...prev,id]);
+  const toggleAll = () => setSelectedIds(prev => prev.length === allIds.length ? [] : allIds);
+  const toggleOne = id => setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
 
   const doBorrow = async () => {
     if (!selectedIds.length || !startDate || !endDate) return;
     const sd = new Date(startDate), ed = new Date(endDate);
-    if (ed<sd) { alert('歸還日需>=起始日'); return; }
+    if (ed < sd) { alert('歸還日需>=起始日'); return; }
     const ok = [];
     for (let id of selectedIds) {
-      const p = pens.find(x=>x.id===id);
+      const p = pens.find(x => x.id === id);
       if (!p.borrower && !p.repairing) {
-        await updateDoc(doc(db,'pens',`${id}`), { borrower: userName, startDate: sd, endDate: ed });
+        await updateDoc(doc(db, 'pens', `${id}`), { borrower: userName, startDate: sd, endDate: ed });
         ok.push(id);
       }
     }
     if (ok.length) alert('借用成功! 感謝您的借閱。請記得維護借用筆的清潔並定時充電避免人為損害，澄銘祝您使用順利!');
-    setPens(prev=> prev.map(p=> ok.includes(p.id)? {...p,borrower:userName,startDate:sd,endDate:ed}:p));
     setSelectedIds([]);
   };
 
@@ -89,14 +92,13 @@ const TabletPenTracker = () => {
     if (!window.confirm(`確定歸還 ${selectedIds.join(', ')}？`)) return;
     const ok = [];
     for (let id of selectedIds) {
-      const p = pens.find(x=>x.id===id);
-      if (isManager || p.borrower===userName) {
-        await updateDoc(doc(db,'pens',`${id}`), { borrower:null, startDate:null, endDate:null });
+      const p = pens.find(x => x.id === id);
+      if (isManager || p.borrower === userName) {
+        await updateDoc(doc(db, 'pens', `${id}`), { borrower: null, startDate: null, endDate: null });
         ok.push(id);
       }
     }
     if (ok.length) alert(`成功歸還：${ok.join(', ')}`);
-    setPens(prev=> prev.map(p=> ok.includes(p.id)? {...p,borrower:null,startDate:null,endDate:null}:p));
     setSelectedIds([]);
   };
 
@@ -104,10 +106,10 @@ const TabletPenTracker = () => {
     if (!isManager || !selectedIds.length) return;
     const ok = [];
     for (let id of selectedIds) {
-      await updateDoc(doc(db,'pens',`${id}`), { repairing:true }); ok.push(id);
+      await updateDoc(doc(db, 'pens', `${id}`), { repairing: true });
+      ok.push(id);
     }
     if (ok.length) alert(`已標記維修中：${ok.join(', ')}`);
-    setPens(prev=> prev.map(p=> ok.includes(p.id)? {...p,repairing:true}:p));
     setSelectedIds([]);
   };
 
@@ -115,10 +117,10 @@ const TabletPenTracker = () => {
     if (!isManager || !selectedIds.length) return;
     const ok = [];
     for (let id of selectedIds) {
-      await updateDoc(doc(db,'pens',`${id}`), { repairing:false }); ok.push(id);
+      await updateDoc(doc(db, 'pens', `${id}`), { repairing: false });
+      ok.push(id);
     }
     if (ok.length) alert(`已完成維修：${ok.join(', ')}`);
-    setPens(prev=> prev.map(p=> ok.includes(p.id)? {...p,repairing:false}:p));
     setSelectedIds([]);
   };
 
@@ -126,16 +128,16 @@ const TabletPenTracker = () => {
   const btnStyle = { fontSize:'1.2rem', padding:'10px 20px', margin:'5px' };
   const gridStyle = { display:'grid', gridTemplateColumns:'repeat(10,1fr)', gap:'10px', fontSize:'1rem' };
 
-  if (stage==='selectMode') return (
+  if (stage === 'selectMode') return (
     <div style={headerStyle}>
       <h1>平板筆借閱系統</h1>
-      <button style={btnStyle} onClick={()=>chooseMode('borrow')}>借用模式</button>
-      <button style={btnStyle} onClick={()=>chooseMode('return')}>歸還模式</button>
-      <button style={btnStyle} onClick={()=>chooseMode('admin')}>管理者模式</button>
+      <button style={btnStyle} onClick={() => chooseMode('borrow')}>借用模式</button>
+      <button style={btnStyle} onClick={() => chooseMode('return')}>歸還模式</button>
+      <button style={btnStyle} onClick={() => chooseMode('admin')}>管理者模式</button>
     </div>
   );
 
-  if (stage==='enterName') return (
+  if (stage === 'enterName') return (
     <div style={{padding:'20px',maxWidth:'400px',margin:'auto'}}>
       <h2 style={{fontSize:'1.3rem'}}>{action==='admin'?'管理者登入':(action==='borrow'?'借用登入':'歸還登入')}</h2>
       <input type='text' placeholder='輸入姓名' value={userName} onChange={e=>setUserName(e.target.value)} style={{width:'100%',padding:'8px',fontSize:'1rem',margin:'10px 0'}} />
@@ -159,20 +161,21 @@ const TabletPenTracker = () => {
       )}
       <div style={gridStyle}>
         <div><input type='checkbox' checked={selectedIds.length===allIds.length} onChange={toggleAll} /> 全選</div>
-        {visible.map(p=>{
-          const days = p.endDate?remainingDays(p.endDate):null;
-          const status = p.repairing?'維修中':p.borrower?(days<=2?'短期':'長期'):'可借用';
-          const color = p.repairing?'gray':p.borrower?(days<=2?'purple':'red'):'black';
+        {visible.map(p => {
+          const days = p.endDate ? remainingDays(p.endDate) : null;
+          const status = p.repairing ? '維修中' : p.borrower ? (days <= 2 ? '短期' : '長期') : '可借用';
+          const color = p.repairing ? 'gray' : p.borrower ? (days <= 2 ? 'purple' : 'red') : 'black';
           return (
             <div key={p.id} style={{border:'1px solid #ccc',padding:'8px',textAlign:'center',color}}>
-              <input type='checkbox'
+              <input
+                type='checkbox'
                 disabled={(action==='borrow'&&(p.borrower||p.repairing))||(action==='return'&&!isManager&&p.borrower!==userName)}
                 checked={selectedIds.includes(p.id)}
                 onChange={()=>toggleOne(p.id)}
               /><br/>
               <span style={{fontSize:'1rem'}}>{p.id}號筆</span><br/>
               <span>{p.borrower||''}</span><br/>
-              {p.startDate&&<span style={{fontSize:'0.8rem'}}>{formatDate(p.startDate)}→{formatDate(p.endDate)}</span>}<br/>
+              {p.startDate && <span style={{fontSize:'0.8rem'}}>{formatDate(p.startDate)}→{formatDate(p.endDate)}</span>}<br/>
               <span style={{fontSize:'0.8rem'}}>{status}</span>
             </div>
           );
