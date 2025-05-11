@@ -1,8 +1,10 @@
-// firebaseConfig.js (優化過版本)
+// src/firebaseConfig.js
+
 import { initializeApp } from "firebase/app";
 import { getFirestore } from "firebase/firestore";
+import { getAuth } from "firebase/auth";
 
-// 你的 Firebase 專案設定
+// 您的 Firebase 專案設定
 const firebaseConfig = {
   apiKey: "AIzaSyB_MAtZPqcZzeTFT-ZgZdGduOekAShkHvM",
   authDomain: "tabletpentracker.firebaseapp.com",
@@ -12,11 +14,9 @@ const firebaseConfig = {
   appId: "1:121253877589:web:4f20b8e074bbcb481a01dc"
 };
 
-// 初始化 Firebase
+// 初始化 Firebase App
 const app = initializeApp(firebaseConfig);
 
-// 初始化 Firestore 資料庫
-const db = getFirestore(app);
-
-// 將db輸出供其他元件使用
-export { db };
+// 初始化並匯出 Firestore 與 Auth
+export const db = getFirestore(app);
+export const auth = getAuth(app);

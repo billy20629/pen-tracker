@@ -1,46 +1,106 @@
 import React, { useState, useEffect } from 'react';
 import { db } from '../firebaseConfig';
-import { collection, doc, onSnapshot, setDoc, getDocs, updateDoc } from 'firebase/firestore';
+import {
+  collection,
+  doc,
+  onSnapshot,
+  setDoc,
+  updateDoc
+} from 'firebase/firestore';
+import {
+  getAuth,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signOut
+} from 'firebase/auth';
 
 const TabletPenTracker = () => {
-  const [stage, setStage] = useState('selectMode');  // 'selectMode', 'enterName', 'borrow', 'return', 'admin'
+  // ─── State 定義 ─────────────────────
+  const [stage, setStage] = useState('selectMode');
+  // selectMode / login / adminLogin / borrow / return / admin / overdue
   const [action, setAction] = useState('');
-  const [userName, setUserName] = useState('');
+  const [user, setUser] = useState(null);
   const [pens, setPens] = useState([]);
   const [selectedIds, setSelectedIds] = useState([]);
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
+  const [adminUser, setAdminUser] = useState('');
+  const [adminPass, setAdminPass] = useState('');
 
-  const isManager = stage === 'admin' && userName.trim().toLowerCase() === 'billy';
+  // Firebase Auth & Provider
+  const auth     = getAuth();
+  const provider = new GoogleAuthProvider();
+  const meEmail  = user?.email ?? '';
 
-  // format and calculate days
-  const formatDate = date => date ? `${date.getFullYear()}/${(date.getMonth()+1).toString().padStart(2,'0')}/${date.getDate().toString().padStart(2,'0')}` : '';
-  const remainingDays = end => end ? Math.ceil((new Date(end) - new Date())/(1000*60*60*24)) : null;
+  // 是否進入真正的管理者模式（帳密登入過）
+  const isManager = stage === 'admin';
 
-  // real-time fetch/init with onSnapshot
+  // ─── Helper 函式 ───────────────────
+  const formatDate = date =>
+    date
+      ? `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, '0')}/${String(
+          date.getDate()
+        ).padStart(2, '0')}`
+      : '';
+  const remainingDays = end =>
+    end ? Math.ceil((new Date(end) - new Date()) / (1000 * 60 * 60 * 24)) : null;
+
+  // ─── 1. 監聽 Auth 狀態 ────────────────
   useEffect(() => {
-    if (stage === 'selectMode' || stage === 'enterName') return;
+    const unsub = auth.onAuthStateChanged(u => {
+      setUser(u);
+      // 若在借用/歸還階段、卻沒有登入，就導回登入畫面
+      if (!u && (stage === 'borrow' || stage === 'return')) {
+        setStage('login');
+      }
+    });
+    return () => unsub();
+  }, [stage]);
+
+  // ─── 2. Firestore 實時監聽 ───────────
+  useEffect(() => {
+    // 只要還沒到借用/歸還/admin/逾期階段，都不用拿資料
+    if (
+      stage === 'selectMode' ||
+      stage === 'login' ||
+      stage === 'adminLogin'
+    ) return;
+
     const pensRef = collection(db, 'pens');
-    const unsubscribe = onSnapshot(pensRef, snapshot => {
-      if (snapshot.empty) {
-        // 如果集合還沒初始化，就一次寫入 1~92 筆
+    const unsub = onSnapshot(pensRef, snap => {
+      if (snap.empty) {
+        // 首次初始化 1~92 支筆，加上 repairing & overdue 欄位
         (async () => {
-          const arr = [];
+          const tmp = [];
           for (let i = 1; i <= 92; i++) {
-            await setDoc(doc(db,'pens',`${i}`), { borrower: null, startDate: null, endDate: null, repairing: false });
-            arr.push({ id: i, borrower: null, startDate: null, endDate: null, repairing: false });
+            await setDoc(doc(db, 'pens', `${i}`), {
+              borrower: null,
+              startDate: null,
+              endDate: null,
+              repairing: false,
+              overdue: false
+            });
+            tmp.push({
+              id: i,
+              borrower: null,
+              startDate: null,
+              endDate: null,
+              repairing: false,
+              overdue: false
+            });
           }
-          setPens(arr);
+          setPens(tmp);
         })();
       } else {
-        const arr = snapshot.docs.map(d => {
+        const arr = snap.docs.map(d => {
           const dt = d.data();
           return {
-            id: parseInt(d.id, 10),
+            id: +d.id,
             borrower: dt.borrower,
             startDate: dt.startDate?.toDate() || null,
             endDate: dt.endDate?.toDate() || null,
-            repairing: dt.repairing || false
+            repairing: dt.repairing || false,
+            overdue: dt.overdue || false
           };
         });
         arr.sort((a, b) => a.id - b.id);
@@ -48,144 +108,333 @@ const TabletPenTracker = () => {
       }
       setSelectedIds([]);
     });
-    return () => unsubscribe();
+    return () => unsub();
   }, [stage]);
 
-  const chooseMode = m => { setAction(m); setStage('enterName'); };
-  const confirmName = () => {
-    if (!userName.trim()) { alert('請注意輸入姓名正確與否'); return; }
-    if (action==='admin' && userName.trim().toLowerCase() !== 'billy') { alert('管理者請輸入正確名稱'); return; }
-    setStage(action);
-  };
-  const logout = () => {
-    setStage('selectMode'); setAction(''); setUserName(''); setSelectedIds([]); setStartDate(''); setEndDate('');
+  // ─── 3. 切換模式 ──────────────────────
+  const chooseMode = m => {
+    setAction(m);
+    if (m === 'admin') {
+      setStage('adminLogin');
+    } else {
+      setStage('login');
+    }
   };
 
-  const visible = (stage==='borrow' || stage==='admin')
-    ? pens
-    : stage==='return'
-      ? (isManager ? pens : pens.filter(p => p.borrower === userName))
-      : [];
+  // ─── 4. Google 登入（借用/歸還） ───────
+  const doGoogleLogin = async () => {
+    try {
+      await signInWithPopup(auth, provider);
+      if (action === 'borrow') setStage('borrow');
+      else if (action === 'return') setStage('return');
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  // ─── 5. 管理者帳號密碼登入 ─────────────
+  const doAdminLogin = () => {
+    if (adminUser === 'admin' && adminPass === 'admin') {
+      setStage('admin');
+    } else {
+      alert('管理者帳號或密碼錯誤');
+      setStage('selectMode');
+    }
+  };
+
+  // ─── 6. 登出（含 Google） ─────────────
+  const doLogout = async () => {
+    await signOut(auth);
+    setStage('selectMode');
+    setAction('');
+    setAdminUser('');
+    setAdminPass('');
+  };
+
+  // ─── 7. 準備可視筆格 ──────────────────
+  let visible = [];
+  if (stage === 'borrow') visible = pens;
+  else if (stage === 'return') visible = pens.filter(p => p.borrower === meEmail);
+  else if (stage === 'admin') visible = pens;
+  else visible = [];
+
   const allIds = visible.map(p => p.id);
+  const toggleAll = () =>
+    setSelectedIds(prev =>
+      prev.length === allIds.length ? [] : [...allIds]
+    );
+  const toggleOne = id =>
+    setSelectedIds(prev =>
+      prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
+    );
 
-  const toggleAll = () => setSelectedIds(prev => prev.length === allIds.length ? [] : allIds);
-  const toggleOne = id => setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
-
+  // ─── 8. 借用/歸還/報修/解除報修/手動逾期 ────
   const doBorrow = async () => {
-    if (!selectedIds.length || !startDate || !endDate) return;
-    const sd = new Date(startDate), ed = new Date(endDate);
-    if (ed < sd) { alert('歸還日需>=起始日'); return; }
-    const ok = [];
+    if (!selectedIds.length || !startDate || !endDate) {
+      alert('請勾選筆並設置起訖日');
+      return;
+    }
+    const sd = new Date(startDate),
+      ed = new Date(endDate);
+    if (ed < sd) {
+      alert('歸還日需 ≥ 起始日');
+      return;
+    }
     for (let id of selectedIds) {
       const p = pens.find(x => x.id === id);
       if (!p.borrower && !p.repairing) {
-        await updateDoc(doc(db, 'pens', `${id}`), { borrower: userName, startDate: sd, endDate: ed });
-        ok.push(id);
+        await updateDoc(doc(db, 'pens', `${id}`), {
+          borrower: meEmail,
+          startDate: sd,
+          endDate: ed
+        });
       }
     }
-    if (ok.length) alert('借用成功! 感謝您的借閱。請記得維護借用筆的清潔並定時充電避免人為損害，澄銘祝您使用順利!');
+    alert('借用成功！祝您使用順利。');
     setSelectedIds([]);
   };
 
   const doReturn = async () => {
     if (!selectedIds.length) return;
     if (!window.confirm(`確定歸還 ${selectedIds.join(', ')}？`)) return;
-    const ok = [];
     for (let id of selectedIds) {
-      const p = pens.find(x => x.id === id);
-      if (isManager || p.borrower === userName) {
-        await updateDoc(doc(db, 'pens', `${id}`), { borrower: null, startDate: null, endDate: null });
-        ok.push(id);
-      }
+      await updateDoc(doc(db, 'pens', `${id}`), {
+        borrower: null,
+        startDate: null,
+        endDate: null
+      });
     }
-    if (ok.length) alert(`成功歸還：${ok.join(', ')}`);
+    alert(`成功歸還：${selectedIds.join(', ')}`);
     setSelectedIds([]);
   };
 
   const doRepair = async () => {
-    if (!isManager || !selectedIds.length) return;
-    const ok = [];
+    if (!selectedIds.length) return;
     for (let id of selectedIds) {
       await updateDoc(doc(db, 'pens', `${id}`), { repairing: true });
-      ok.push(id);
     }
-    if (ok.length) alert(`已標記維修中：${ok.join(', ')}`);
+    alert(`已標記維修中：${selectedIds.join(', ')}`);
     setSelectedIds([]);
   };
 
   const doRepairDone = async () => {
-    if (!isManager || !selectedIds.length) return;
-    const ok = [];
+    if (!selectedIds.length) return;
     for (let id of selectedIds) {
       await updateDoc(doc(db, 'pens', `${id}`), { repairing: false });
-      ok.push(id);
     }
-    if (ok.length) alert(`已完成維修：${ok.join(', ')}`);
+    alert(`已解除報修：${selectedIds.join(', ')}`);
     setSelectedIds([]);
   };
 
-  const headerStyle = { padding:'20px', textAlign:'center', fontSize:'1.5rem' };
-  const btnStyle = { fontSize:'1.2rem', padding:'10px 20px', margin:'5px' };
-  const gridStyle = { display:'grid', gridTemplateColumns:'repeat(10,1fr)', gap:'10px', fontSize:'1rem' };
+  const doMarkOverdue = async () => {
+    if (!selectedIds.length) return;
+    for (let id of selectedIds) {
+      await updateDoc(doc(db, 'pens', `${id}`), { overdue: true });
+    }
+    alert(`已標記逾期：${selectedIds.join(', ')}`);
+    setSelectedIds([]);
+  };
 
-  if (stage === 'selectMode') return (
-    <div style={headerStyle}>
-      <h1>平板筆借閱系統</h1>
-      <button style={btnStyle} onClick={() => chooseMode('borrow')}>借用模式</button>
-      <button style={btnStyle} onClick={() => chooseMode('return')}>歸還模式</button>
-      <button style={btnStyle} onClick={() => chooseMode('admin')}>管理者模式</button>
-    </div>
-  );
+  const doClearOverdue = async () => {
+    if (!selectedIds.length) return;
+    for (let id of selectedIds) {
+      await updateDoc(doc(db, 'pens', `${id}`), { overdue: false });
+    }
+    alert(`已取消逾期：${selectedIds.join(', ')}`);
+    setSelectedIds([]);
+  };
 
-  if (stage === 'enterName') return (
-    <div style={{padding:'20px',maxWidth:'400px',margin:'auto'}}>
-      <h2 style={{fontSize:'1.3rem'}}>{action==='admin'?'管理者登入':(action==='borrow'?'借用登入':'歸還登入')}</h2>
-      <input type='text' placeholder='輸入姓名' value={userName} onChange={e=>setUserName(e.target.value)} style={{width:'100%',padding:'8px',fontSize:'1rem',margin:'10px 0'}} />
-      <button style={btnStyle} onClick={confirmName}>確定</button>
-      <button style={btnStyle} onClick={logout}>取消</button>
-    </div>
-  );
+  // ─── 9. 逾期清單 ──────────────────────
+  const overdueList = pens
+    .filter(p => p.borrower && p.endDate < new Date())
+    .sort((a, b) => a.endDate - b.endDate);
 
-  return (
-    <div style={{padding:'20px'}}>
-      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'10px'}}>
-        <h2 style={{fontSize:'1.3rem'}}>{action==='borrow'||stage==='admin'?'借用模式':'歸還模式'} - {isManager?'管理者':userName}</h2>
-        <button style={btnStyle} onClick={logout}>登出</button>
+  // ─── UI ──────────────────────────────
+
+  // a) 主選單
+  if (stage === 'selectMode') {
+    return (
+      <div style={{ textAlign: 'center', padding: 20 }}>
+        <h1>平板筆借閱系統</h1>
+        <button onClick={() => chooseMode('borrow')}>借用模式</button>
+        <button onClick={() => chooseMode('return')}>歸還模式</button>
+        <button onClick={() => chooseMode('admin')}>管理者模式</button>
       </div>
-      {(action==='borrow'||stage==='admin') && (
-        <div style={{margin:'10px 0'}}>
-          <span style={{fontSize:'1rem'}}>請勾選您要借用的筆並選擇借用時間後按下借出。</span><br/>
-          <label>起始日: <input type='date' value={startDate} onChange={e=>setStartDate(e.target.value)} /></label>
-          <label style={{marginLeft:'10px'}}>歸還日: <input type='date' value={endDate} onChange={e=>setEndDate(e.target.value)} /></label>
+    );
+  }
+
+  // b) 借用/歸還 Google 登入
+  if (stage === 'login') {
+    return (
+      <div style={{ textAlign: 'center', padding: 20 }}>
+        <h2>請使用 Google 帳號登入</h2>
+        <button onClick={doGoogleLogin}>使用 Google 登入</button>
+      </div>
+    );
+  }
+
+  // c) 管理者 帳號/密碼 登入
+  if (stage === 'adminLogin') {
+    return (
+      <div style={{ maxWidth: 300, margin: '40px auto', textAlign: 'center' }}>
+        <h2>管理者登入</h2>
+        <input
+          placeholder="帳號"
+          value={adminUser}
+          onChange={e => setAdminUser(e.target.value)}
+        /><br/><br/>
+        <input
+          placeholder="密碼"
+          type="password"
+          value={adminPass}
+          onChange={e => setAdminPass(e.target.value)}
+        /><br/><br/>
+        <button onClick={doAdminLogin}>登入</button>
+      </div>
+    );
+  }
+
+  // d) 借用 / 歸還 / 管理者 / 逾期 未歸 查詢
+  return (
+    <div style={{ padding: 20 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+        <h2>
+          {stage === 'borrow'
+            ? `借用模式 - ${meEmail}`
+            : stage === 'return'
+            ? `歸還模式 - ${meEmail}`
+            : stage === 'admin'
+            ? `管理者模式`
+            : '逾期未歸查詢'}
+        </h2>
+        <button onClick={doLogout}>登出</button>
+      </div>
+
+      {/* 借用說明 + 日期選擇 */}
+      {(stage === 'borrow' || stage === 'admin') && (
+        <div style={{ marginBottom: 10 }}>
+          <div>請勾選並選擇起訖日期後點擊「點我按借用」。</div>
+          <label>
+            起始日:
+            <input
+              type="date"
+              value={startDate}
+              onChange={e => setStartDate(e.target.value)}
+            />
+          </label>
+          <label style={{ marginLeft: 20 }}>
+            歸還日:
+            <input
+              type="date"
+              value={endDate}
+              onChange={e => setEndDate(e.target.value)}
+            />
+          </label>
         </div>
       )}
-      <div style={gridStyle}>
-        <div><input type='checkbox' checked={selectedIds.length===allIds.length} onChange={toggleAll} /> 全選</div>
-        {visible.map(p => {
-          const days = p.endDate ? remainingDays(p.endDate) : null;
-          const status = p.repairing ? '維修中' : p.borrower ? (days <= 2 ? '短期' : '長期') : '可借用';
-          const color = p.repairing ? 'gray' : p.borrower ? (days <= 2 ? 'purple' : 'red') : 'black';
-          return (
-            <div key={p.id} style={{border:'1px solid #ccc',padding:'8px',textAlign:'center',color}}>
-              <input
-                type='checkbox'
-                disabled={(action==='borrow'&&(p.borrower||p.repairing))||(action==='return'&&!isManager&&p.borrower!==userName)}
-                checked={selectedIds.includes(p.id)}
-                onChange={()=>toggleOne(p.id)}
-              /><br/>
-              <span style={{fontSize:'1rem'}}>{p.id}號筆</span><br/>
-              <span>{p.borrower||''}</span><br/>
-              {p.startDate && <span style={{fontSize:'0.8rem'}}>{formatDate(p.startDate)}→{formatDate(p.endDate)}</span>}<br/>
-              <span style={{fontSize:'0.8rem'}}>{status}</span>
-            </div>
-          );
-        })}
-      </div>
-      <div style={{marginTop:'10px'}}>
-        {(action==='borrow'||stage==='admin') && <button style={btnStyle} onClick={doBorrow}>借出</button>}
-        {(action==='return'||stage==='admin') && <button style={btnStyle} onClick={doReturn}>歸還</button>}
-        {stage==='admin' && (<><button style={btnStyle} onClick={doRepair}>報修</button><button style={btnStyle} onClick={doRepairDone}>維修完成</button></>)}
-      </div>
+
+      {/* 筆格列表 */}
+      {stage !== 'overdue' && (
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fill, minmax(120px,1fr))',
+            gap: 10
+          }}
+        >
+          <div>
+            <input
+              type="checkbox"
+              checked={selectedIds.length === allIds.length && allIds.length > 0}
+              onChange={toggleAll}
+            /> 全選
+          </div>
+
+          {visible.map(p => {
+            const days = p.endDate ? remainingDays(p.endDate) : null;
+            const status = p.repairing
+              ? '維修中'
+              : p.borrower
+              ? days <= 2
+                ? '短期'
+                : '長期'
+              : '可借用';
+            const disabled =
+              stage === 'borrow'
+                ? p.borrower || p.repairing
+                : stage === 'return'
+                ? !p.borrower
+                : false;
+            return (
+              <div
+                key={p.id}
+                style={{
+                  border: '1px solid #ccc',
+                  padding: 8,
+                  textAlign: 'center'
+                }}
+              >
+                <input
+                  type="checkbox"
+                  disabled={disabled}
+                  checked={selectedIds.includes(p.id)}
+                  onChange={() => toggleOne(p.id)}
+                /><br/>
+                <strong>{p.id}號筆</strong><br/>
+                <div style={{ color: p.repairing ? 'gray' : p.borrower ? 'red' : 'black' }}>
+                  {p.borrower || ''}
+                </div>
+                {p.startDate && (
+                  <div style={{ fontSize: '0.8rem' }}>
+                    {formatDate(p.startDate)} → {formatDate(p.endDate)}
+                  </div>
+                )}
+                <div style={{ fontSize: '0.8rem' }}>{status}</div>
+                {p.overdue && <div style={{ color: 'orange' }}>手動逾期</div>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* 操作按鈕 */}
+      {stage !== 'overdue' && (
+        <div style={{ marginTop: 20, display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+          {(stage === 'borrow' || stage === 'admin') && (
+            <button onClick={doBorrow}>點我按借用</button>
+          )}
+          {(stage === 'return' || stage === 'admin') && (
+            <button onClick={doReturn}>點我按歸還</button>
+          )}
+          {stage === 'admin' && (
+            <>
+              <button onClick={doRepair}>報修</button>
+              <button onClick={doRepairDone}>解除報修</button>
+              <button onClick={doMarkOverdue}>標記逾期</button>
+              <button onClick={doClearOverdue}>解除逾期</button>
+              <button onClick={() => setStage('overdue')}>逾期未歸查詢</button>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* 逾期未歸清單 */}
+      {stage === 'overdue' && (
+        <div style={{ marginTop: 30 }}>
+          <h3>逾期未歸查詢</h3>
+          <p>
+            請帥氣的你儘速聯絡逾期借用人，提醒他們歸還。
+          </p>
+          <ul>
+            {overdueList.map(p => (
+              <li key={p.id}>
+                {p.borrower} – {p.id}號筆 – 應於 {formatDate(p.endDate)}
+              </li>
+            ))}
+          </ul>
+          <button onClick={() => setStage('admin')}>返回管理者介面</button>
+        </div>
+      )}
     </div>
   );
 };
